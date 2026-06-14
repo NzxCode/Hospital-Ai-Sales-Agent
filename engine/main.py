@@ -8,28 +8,64 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, RedirectResponse, Response
 
 from agent import run_agent
 from database import init_db, seed_db
 from memory import memory
+from routes.dashboard import router as dashboard_router
 from whatsapp import extract_incoming, fetch_media_b64, send_reply
 
 load_dotenv()
 
 BUFFER_SECONDS = float(os.getenv("BUFFER_SECONDS", "8"))
 
-# Folder simpan gambar customer (dipakai dashboard Day 2 untuk render thumbnail).
+# Folder simpan gambar customer (fallback lokal saat R2 belum dikonfigurasi).
 MEDIA_DIR = Path(__file__).parent / "media"
 MEDIA_DIR.mkdir(exist_ok=True)
 
+# ---- Cloudflare R2 / S3 (opsional) -----------------------------------------
+# Kalau R2_BUCKET kosong -> simpan ke disk lokal. Kalau diisi -> upload ke R2.
+R2_ENDPOINT = os.getenv("R2_ENDPOINT", "")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET = os.getenv("R2_BUCKET", "")
+R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL", "").rstrip("/")
+
+# R2 hanya aktif kalau SEMUA nilai terisi; kalau belum -> fallback lokal (aman).
+R2_ENABLED = all([R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_PUBLIC_URL])
+
+EXT = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+_s3 = None
+
+
+def _get_s3():
+    """Lazy init klien S3 (boto3 hanya di-import kalau R2 dipakai)."""
+    global _s3
+    if _s3 is None:
+        import boto3
+        _s3 = boto3.client(
+            "s3", endpoint_url=R2_ENDPOINT,
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            region_name="auto",
+        )
+    return _s3
+
 
 def save_media(phone: str, data: bytes, mime: str) -> str:
-    """Simpan byte gambar ke folder media, return path relatif untuk dashboard."""
-    ext = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}.get(mime, "jpg")
-    fname = f"{phone}_{uuid.uuid4().hex[:8]}.{ext}"
-    (MEDIA_DIR / fname).write_bytes(data)
-    return f"media/{fname}"
+    """Simpan byte gambar, kembalikan path relatif 'media/<file>'.
+
+    Penyimpanan: R2 (kalau aktif) atau disk lokal. Penyajian: SELALU lewat
+    route /media/<file> di app (lihat fungsi media()), bukan URL R2 langsung.
+    """
+    fname = f"{phone}_{uuid.uuid4().hex[:8]}.{EXT.get(mime, 'jpg')}"
+    if R2_ENABLED:
+        _get_s3().put_object(Bucket=R2_BUCKET, Key=fname, Body=data, ContentType=mime)
+    else:
+        (MEDIA_DIR / fname).write_bytes(data)
+    return f"media/{fname}"   # selalu disajikan lewat /media/<file> (proxy app)
 
 
 # Tiap item buffer adalah dict dari extract_incoming (teks dan/atau gambar).
@@ -49,6 +85,37 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Glowria AI Sales Agent", lifespan=lifespan)
 
+# Dashboard (Day 2): router
+app.include_router(dashboard_router)
+
+
+@app.get("/")
+def root():
+    """Buka domain langsung (localhost/Railway) -> arahkan ke dashboard."""
+    return RedirectResponse(url="/dashboard")
+
+
+@app.get("/media/{fname}")
+def media(fname: str):
+    """Sajikan gambar lewat domain app (proxy): ambil dari R2 kalau aktif, else disk.
+
+    Browser tidak pernah menyentuh domain R2 publik (r2.dev) -> kebal blokir/
+    intersepsi TLS di jaringan tertentu. Server (Railway) yang ambil dari R2.
+    """
+    fname = os.path.basename(fname)                       # cegah path traversal
+    headers = {"Cache-Control": "public, max-age=86400"}
+    if R2_ENABLED:
+        try:
+            obj = _get_s3().get_object(Bucket=R2_BUCKET, Key=fname)
+        except Exception:
+            raise HTTPException(status_code=404, detail="Gambar tidak ditemukan.")
+        return Response(content=obj["Body"].read(),
+                        media_type=obj.get("ContentType", "image/jpeg"), headers=headers)
+    fpath = MEDIA_DIR / fname
+    if not fpath.exists():
+        raise HTTPException(status_code=404, detail="Gambar tidak ditemukan.")
+    return FileResponse(fpath, headers=headers)
+
 
 
 async def process_buffered_messages(phone: str) -> None:
@@ -59,6 +126,11 @@ async def process_buffered_messages(phone: str) -> None:
         pending = buffers.pop(phone, [])
         if not pending:
             return
+
+        # Simpan nama WhatsApp customer (pushName) -> tampil di dashboard
+        name = next((i.get("name") for i in reversed(pending) if i.get("name")), None)
+        if name:
+            memory.set_name(phone, name)
 
         # Gabung teks + ambil & simpan gambar (decrypt base64 via Evolution).
         texts: list[str] = []
